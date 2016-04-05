@@ -1,85 +1,90 @@
-// Full Adder
-module fa(sum, cout, a, b, cin);
-output sum, cout;
-input a, b, cin;
-wire aorb, gen, prop;
-xor(sum, a, b, cin); // sum
-and(gen, a, b);      // generate
-or(aorb, a, b);      // propogate
-and(prop, aorb, cin);
-or(cout, gen, prop); // cout
-endmodule
+// basic sizes of things
+`define WORD	[15:0]
+`define Opcode	[15:12]
+`define Dest	[11:6]
+`define Src	[5:0]
+`define STATE	[4:0]
+`define REGSIZE [63:0]
+`define MEMSIZE [65535:0]
 
-// ripple carry ADD, 8-bit
-module add8(sum, a, b);
-output [7:0] sum;
-input [7:0] a, b;
-wire [7:0] cout;
-fa fa0(sum[0], cout[0], a[0], b[0], 0),
-   fa1(sum[1], cout[1], a[1], b[1], cout[0]),
-   fa2(sum[2], cout[2], a[2], b[2], cout[1]),
-   fa3(sum[3], cout[3], a[3], b[3], cout[2]),
-   fa4(sum[4], cout[4], a[4], b[4], cout[3]),
-   fa5(sum[5], cout[5], a[5], b[5], cout[4]),
-   fa6(sum[6], cout[6], a[6], b[6], cout[5]),
-   fa7(sum[7], cout[7], a[7], b[7], cout[6]);
-endmodule
+// opcode values, also state numbers
+`define OPadd	4'b0000
+`define OPinvf	4'b0001
+`define OPaddf	4'b0010
+`define OPmulf	4'b0011
+`define OPand	4'b0100
+`define OPor	4'b0101
+`define OPxor	4'b0110
+`define OPany	4'b0111
+`define OPdup	4'b1000
+`define OPshr	4'b1001
+`define OPf2i	4'b1010
+`define OPi2f	4'b1011
+`define OPld	4'b1100
+`define OPst	4'b1101
+`define OPjzsz	4'b1110
+`define OPli	4'b1111
 
-// signed SATuration ADD, 8-bit
-module satadd8(sum, a, b);
-output reg [7:0] sum;
-input [7:0] a, b;
-wire [7:0] modsum;
-add8 modadd8(modsum, a, b);
-always @(modsum) begin
-  if ((a[7] == b[7]) &&
-      (a[7] != modsum[7])) begin
-    if (modsum[7]) sum = 127;
-    else sum = -128;
-  end else begin
-    sum = modsum;
-  end
+// state numbers only
+`define OPjz	`OPjzsz
+`define OPsys	5'b10000
+`define OPsz	5'b10001
+`define Start	5'b11111
+`define Start1	5'b11110
+
+// source field values for sys and sz
+`define SRCsys	6'b000000
+`define SRCsz	6'b000001
+
+module processor(halt, reset, clk);
+output reg halt;
+input reset, clk;
+
+reg `WORD regfile `REGSIZE;
+reg `WORD mainmem `MEMSIZE;
+reg `WORD pc = 0;
+reg `WORD ir;
+reg `STATE s = `Start;
+integer a;
+
+always @(reset) begin
+  halt = 0;
+  pc = 0;
+  s = `Start;
+  $readmemh0(regfile);
+  $readmemh1(mainmem);
 end
-endmodule
 
-// REFerence signed SATuration ADD, 8-bit
-module refsatadd8(s, a, b);
-output reg signed [7:0] s;
-input signed [7:0] a, b;
-reg signed [8:0] t;
-always @* begin
-  t = a + b;                 // 9-bit result
-  if (t < -128) s = -128;    // signed less than
-  else if (t > 127) s = 127; // signed greater than
-  else s = t[7:0];
-end
-endmodule
+always @(posedge clk) begin
+  case (s)
+    `Start: begin ir <= mainmem[pc]; s <= `Start1; end
+    `Start1: begin
+             pc <= pc + 1;            // bump pc
+	     case (ir `Opcode)
+	     `OPjzsz:
+                case (ir `Src)	      // use Src as extended opcode
+                `SRCsys: s <= `OPsys; // sys call
+                `SRCsz: s <= `OPsz;   // sz
+                default: s <= `OPjz;  // jz
+	     endcase
+             default: s <= ir `Opcode; // most instructions, state # is opcode
+	     endcase
+	    end
 
-// TEST BENCH
-module testbench;
-reg signed [7:0] a, b, s, sref;
-integer correct = 0;
-integer failed = 0;
-wire [7:0] sw, swref;
-satadd8 uut(sw, a, b);
-refsatadd8 oracle(swref, a, b);
-initial begin
-  a=0;
-  repeat (256) begin
-    b=0;
-    repeat (256) #1 begin
-      s = sw;
-      sref = swref;
-      if (s != sref) begin
-        $display("Wrong: %d+%d=%d, but got %d", a, b, sref, s);
-        failed = failed + 1;
-      end else begin
-        correct = correct + 1;
-      end
-      b = b + 1;
-    end
-    a = a + 1;
-  end
-  $display("All cases tested; %d correct, %d failed", correct, failed);
+    `OPadd: begin regfile[ir `Dest] <= regfile[ir `Dest] + regfile[ir `Src]; s <= `Start; end
+    `OPand: begin regfile[ir `Dest] <= regfile[ir `Dest] & regfile[ir `Src]; s <= `Start; end
+    `OPany: begin regfile[ir `Dest] <= |regfile[ir `Src]; s <= `Start; end
+    `OPdup: begin regfile[ir `Dest] <= regfile[ir `Src]; s <= `Start; end
+    `OPjz: begin if (regfile[ir `Dest] == 0) pc <= regfile[ir `Src]; s <= `Start; end
+    `OPld: begin regfile[ir `Dest] <= mainmem[regfile[ir `Src]]; s <= `Start; end
+    `OPli: begin regfile[ir `Dest] <= mainmem[pc]; pc <= pc + 1; s <= `Start; end
+    `OPor: begin regfile[ir `Dest] <= regfile[ir `Dest] | regfile[ir `Src]; s <= `Start; end
+    `OPsz: begin if (regfile[ir `Dest] == 0) pc <= pc + 1; s <= `Start; end
+    `OPshr: begin regfile[ir `Dest] <= regfile[ir `Src] >> 1; s <= `Start; end
+    `OPst: begin mainmem[regfile[ir `Src]] <= regfile[ir `Dest]; s <= `Start; end
+    `OPxor: begin regfile[ir `Dest] <= regfile[ir `Dest] ^ regfile[ir `Src]; s <= `Start; end
+
+    default: halt <= 1;
+  endcase
 end
 endmodule
